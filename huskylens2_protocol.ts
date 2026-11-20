@@ -75,6 +75,10 @@ namespace huskylens2 {
         ContentSizeIndex = 4,
         ContentIndex = 5,
         ProtocolSize = 6,
+        //===================== Packet Data ====================
+        // Fixed Data header size. Protocol V0.4 (firmware 1.4.2+) extended it from 10 to 14 bytes
+        // (a 4-byte confidence field was added at offset 10).
+        DataHeaderSize = 14,
         //===================== Time out ====================
         Timeout = 2000
     }
@@ -298,9 +302,24 @@ namespace huskylens2 {
 
         get total_blocks_learned() { const value = this.buffer[8] + this.buffer[9] * 256; return value > 32767 ? value - 65536 : value; }
         set total_blocks_learned(v: number) { v = Math.max(-32768, Math.min(32767, v)); if (v < 0) v += 65536; this.buffer[8] = v & 0xff; this.buffer[9] = (v >> 8) & 0xff; }
-        get payload() {
-            return this.buffer.slice(10);
+        // Seventh union - int32_t / float (buffer[10..13]), added in protocol V0.4
+        get confidence() {
+            if (this.buffer.length < Macro.DataHeaderSize) return 0;
+            return this.buffer.getNumber(NumberFormat.Float32LE, 10);
         }
+
+        get payload() {
+            return this.buffer.slice(Macro.DataHeaderSize);
+        }
+    }
+
+    // Helper function: read a length-prefixed string (String_t: 1-byte length + bytes) from a payload.
+    // Falls back to reading up to the first \0 if the payload does not look length-prefixed.
+    function payloadToString(buf: Buffer): string {
+        if (buf.length >= 2 && buf[0] > 0 && buf[0] <= buf.length - 1) {
+            return bufferToStringAtOffset(buf, 1, buf[0]);
+        }
+        return bufferToString(buf);
     }
     // Helper function: Convert Buffer to hexadecimal string (for debugging)
     function bufferToHex(buf: Buffer, maxLen: number = 50): string {
@@ -399,17 +418,22 @@ namespace huskylens2 {
         constructor(buffer: Buffer) {
             super(buffer);
 
-            const name_length = buffer[10];
+            // Protocol V0.4 (firmware 1.4.2+): 14-byte fixed Data header
+            // (offset 10-13 = confidence), strings start at offset 14.
+            const S = Macro.DataHeaderSize;
+            if (buffer.length <= S) {
+                return;
+            }
+            const name_length = buffer[S];
 
             // Check if name_length is 0, if so, there is no name field
             if (name_length === 0) {
                 this.name = "";
                 // For license plate and OCR recognition, content may still exist even when name_length is 0
-                // Try to parse content from buffer[11] if buffer is long enough
-                if (buffer.length > 11) {
-                    const content_length = buffer[11];
-                    if (content_length > 0 && buffer.length > 12 + content_length) {
-                        this.content = bufferToStringAtOffset(buffer, 12, content_length);
+                if (buffer.length > S + 1) {
+                    const content_length = buffer[S + 1];
+                    if (content_length > 0 && buffer.length >= S + 2 + content_length) {
+                        this.content = bufferToStringAtOffset(buffer, S + 2, content_length);
                     } else {
                         this.content = "";
                     }
@@ -419,11 +443,12 @@ namespace huskylens2 {
                 return;
             }
 
-            const content_length = buffer[11 + name_length];
-
             // Directly decode from buffer at specific offsets, avoiding slice() which may have issues in MakeCode
-            this.name = bufferToStringAtOffset(buffer, 11, name_length);
-            this.content = bufferToStringAtOffset(buffer, 12 + name_length, content_length);
+            this.name = bufferToStringAtOffset(buffer, S + 1, name_length);
+            if (buffer.length > S + 1 + name_length) {
+                const content_length = buffer[S + 1 + name_length];
+                this.content = bufferToStringAtOffset(buffer, S + 2 + name_length, content_length);
+            }
         }
 
         printInfo() {
@@ -582,15 +607,45 @@ namespace huskylens2 {
     }
 
     /**
-     * Create and initialize a 10-byte Buffer (first byte set to the specified value, rest are 0)
+     * Create and initialize a 14-byte Data header Buffer (first byte set to the specified value, rest are 0)
      * @param firstByte Value of the first byte
      */
     function createInitializedBuffer(firstByte: number): Buffer {
-        const buf = Buffer.create(10);
+        const buf = Buffer.create(Macro.DataHeaderSize);
+        buf.fill(0);
         buf[0] = firstByte;
-        for (let i = 1; i < 10; i++) {
-            buf[i] = 0;
-        }
+        return buf;
+    }
+
+    /**
+     * Write an int16 (little endian) into a buffer.
+     */
+    function writeInt16LE(buf: Buffer, offset: number, v: number): void {
+        buf[offset] = v & 0xFF;
+        buf[offset + 1] = (v >> 8) & 0xFF;
+    }
+
+    /**
+     * Write an int32 (little endian) into a buffer.
+     */
+    function writeInt32LE(buf: Buffer, offset: number, v: number): void {
+        buf[offset] = v & 0xFF;
+        buf[offset + 1] = (v >> 8) & 0xFF;
+        buf[offset + 2] = (v >> 16) & 0xFF;
+        buf[offset + 3] = (v >> 24) & 0xFF;
+    }
+
+    /**
+     * Append a length-prefixed string (1-byte length + UTF-8 bytes) after a 14-byte Data header.
+     * Returns the complete Data buffer.
+     */
+    function appendString(header: Buffer, text: string): Buffer {
+        let strBuf = Buffer.fromUTF8(text);
+        if (strBuf.length > 200) strBuf = strBuf.slice(0, 200); // data_length is a single byte
+        const buf = Buffer.create(header.length + 1 + strBuf.length);
+        for (let i = 0; i < header.length; i++) buf[i] = header[i];
+        buf[header.length] = strBuf.length;
+        for (let i = 0; i < strBuf.length; i++) buf[header.length + 1 + i] = strBuf[i];
         return buf;
     }
 
@@ -676,24 +731,18 @@ namespace huskylens2 {
     }
 
     /**
-     * Create a 10-byte Buffer with coordinates and size (for CommandActionLearnBlock)
+     * Create a 14-byte Buffer with coordinates and size (for CommandActionLearnBlock)
      * @param x x Coordinate
      * @param y y Coordinate
      * @param w Width
      * @param h Height
      */
     function createBoxBuffer(x: number, y: number, w: number, h: number): Buffer {
-        const dataBuf = Buffer.create(10);
-        dataBuf[0] = 0;   // reserved
-        dataBuf[1] = 0;   // reserved
-        dataBuf[2] = x & 0xFF;
-        dataBuf[3] = (x >> 8) & 0xFF;
-        dataBuf[4] = y & 0xFF;
-        dataBuf[5] = (y >> 8) & 0xFF;
-        dataBuf[6] = w & 0xFF;
-        dataBuf[7] = (w >> 8) & 0xFF;
-        dataBuf[8] = h & 0xFF;
-        dataBuf[9] = (h >> 8) & 0xFF;
+        const dataBuf = createInitializedBuffer(0);  // [0],[1] reserved, [10..13] reserved
+        writeInt16LE(dataBuf, 2, x);
+        writeInt16LE(dataBuf, 4, y);
+        writeInt16LE(dataBuf, 6, w);
+        writeInt16LE(dataBuf, 8, h);
         return dataBuf;
     }
 
@@ -1009,28 +1058,11 @@ namespace huskylens2 {
         if (volume < 0) volume = 0;
         if (volume > 100) volume = 100;
 
-        // Create command packet
-        const dataBuf = Buffer.create(10);
-        dataBuf[0] = 0;  // Reserved byte
-        dataBuf[1] = 0;  // Reserved byte
-        // Set volume (16-bit integer)
-        dataBuf[2] = volume & 0xFF;
-        dataBuf[3] = (volume >> 8) & 0xFF;
-        // Add six zero bytes
-        for (let i = 4; i < 10; i++) {
-            dataBuf[i] = 0;
-        }
-
-        // Create packet header including string data
-        const nameBuf = Buffer.fromUTF8(name);
-        const totalBuf = Buffer.create(11 + nameBuf.length); // 10-byte data + 1-byte length + name length
-        for (let i = 0; i < 10; i++) {
-            totalBuf[i] = dataBuf[i];
-        }
-        totalBuf[10] = nameBuf.length; // Name length
-        for (let i = 0; i < nameBuf.length; i++) {
-            totalBuf[11 + i] = nameBuf[i];
-        }
+        // 14-byte Data header: [0],[1] reserved, [2..3] volume (int16), [4..13] zero
+        const dataBuf = createInitializedBuffer(0);
+        writeInt16LE(dataBuf, 2, volume);
+        // Then a length-prefixed file name
+        const totalBuf = appendString(dataBuf, name);
 
         // Send command and wait for response
         sendCommandAndCheckResponse(Macro.CommandActionPlayMusic, Algorithm.AlgorithmAny, totalBuf);
@@ -1047,7 +1079,7 @@ namespace huskylens2 {
         const dataBuf = createInitializedBuffer(2);  // Set resolution 2: RESOLUTION_1280x720
         const packetData = sendCommandAndGetResponse(Macro.CommandActionTakePhoto, Algorithm.AlgorithmAny, dataBuf);
         if (packetData) {
-            photoName = bufferToString(packetData.payload);
+            photoName = payloadToString(packetData.payload);
         }
     }
     let screenshotName: string = "";
@@ -1067,7 +1099,7 @@ namespace huskylens2 {
 
         const packetData = sendCommandAndGetResponse(Macro.CommandActionTakeScreenshot, Algorithm.AlgorithmAny, dataBuf);
         if (packetData) {
-            screenshotName = bufferToString(packetData.payload);
+            screenshotName = payloadToString(packetData.payload);
         }
     }
 
@@ -1104,27 +1136,14 @@ namespace huskylens2 {
      */
     //% blockHidden=true
     export function drawBoxInternal(cmd: number, color: number, lineWidth: number, x: number, y: number, w: number, h: number): void {
-        const dataBuf = Buffer.create(16);
-        dataBuf[0] = 0;  // Reserved byte
-        dataBuf[1] = lineWidth;  // Line width
-
-        // Set coordinates and size (int16_t)
-        dataBuf[2] = x & 0xFF;
-        dataBuf[3] = (x >> 8) & 0xFF;
-        dataBuf[4] = y & 0xFF;
-        dataBuf[5] = (y >> 8) & 0xFF;
-        dataBuf[6] = w & 0xFF;
-        dataBuf[7] = (w >> 8) & 0xFF;
-        dataBuf[8] = h & 0xFF;
-        dataBuf[9] = (h >> 8) & 0xFF;
-        dataBuf[10] = 0;  // Reserved
-        dataBuf[11] = 0;  // Reserved
-
-        // Set color (int32_t)
-        dataBuf[12] = color & 0xFF;
-        dataBuf[13] = (color >> 8) & 0xFF;
-        dataBuf[14] = (color >> 16) & 0xFF;
-        dataBuf[15] = (color >> 24) & 0xFF;
+        // 14-byte Data: [0] reserved, [1] line width, [2..9] x,y,w,h (int16), [10..13] color (int32)
+        const dataBuf = createInitializedBuffer(0);
+        dataBuf[1] = lineWidth;
+        writeInt16LE(dataBuf, 2, x);
+        writeInt16LE(dataBuf, 4, y);
+        writeInt16LE(dataBuf, 6, w);
+        writeInt16LE(dataBuf, 8, h);
+        writeInt32LE(dataBuf, 10, color);
 
         // Send command and wait for response
         sendCommandAndCheckResponse(cmd, Algorithm.AlgorithmAny, dataBuf);
@@ -1208,40 +1227,14 @@ namespace huskylens2 {
     //% x.min=0 x.max=640
     //% y.min=0 y.max=480
     export function showText(color: number, fontSize: FontSize, x: number, y: number, content: string): void {
-        const textBuf = Buffer.fromUTF8(content);
-        const dataBuf = Buffer.create(20 + textBuf.length);
-
-        dataBuf[0] = 0;  // Reserved byte
-        dataBuf[1] = fontSize;  // Font size
-
-        // Set coordinates (int16_t)
-        dataBuf[2] = x & 0xFF;
-        dataBuf[3] = (x >> 8) & 0xFF;
-        dataBuf[4] = y & 0xFF;
-        dataBuf[5] = (y >> 8) & 0xFF;
-
-        // Reserved fields
-        dataBuf[6] = 0;  // Reserved
-        dataBuf[7] = 0;  // Reserved
-        dataBuf[8] = 0;  // Reserved
-        dataBuf[9] = 0;  // Reserved
-
-        // Text length
-        dataBuf[10] = textBuf.length;
-
-        // Text content
-        for (let i = 0; i < textBuf.length; i++) {
-            dataBuf[11 + i] = textBuf[i];
-        }
-
-        // Terminator and color
-        dataBuf[11 + textBuf.length] = 0;  // Terminator
-
-        // Set color (int32_t)
-        dataBuf[12 + textBuf.length] = color & 0xFF;
-        dataBuf[13 + textBuf.length] = (color >> 8) & 0xFF;
-        dataBuf[14 + textBuf.length] = (color >> 16) & 0xFF;
-        dataBuf[15 + textBuf.length] = (color >> 24) & 0xFF;
+        // 14-byte Data header: [0] reserved, [1] font size, [2..5] x,y (int16), [6..9] reserved,
+        // [10..13] color (int32). Then a length-prefixed UTF-8 text.
+        const header = createInitializedBuffer(0);
+        header[1] = fontSize;
+        writeInt16LE(header, 2, x);
+        writeInt16LE(header, 4, y);
+        writeInt32LE(header, 10, color);
+        const dataBuf = appendString(header, content);
 
         // Send command and wait for response
         sendCommandAndCheckResponse(Macro.CommandActionDrawText, Algorithm.AlgorithmAny, dataBuf);
@@ -1307,7 +1300,7 @@ namespace huskylens2 {
     //% subcategory="learning /forgetting"
     //% algorithmId.defl=huskylens2.AlgorithmLearnObjectAtCenter.AlgorithmFaceRecognition
     export function learnObjectAtCenter(algorithmId: AlgorithmLearnObjectAtCenter): void {
-        learn_id = sendLearnCommand(Macro.CommandActionLearn, algorithmId, createInitializedBuffer(0));
+        learn_id = sendLearnCommand(Macro.CommandActionLearn, algorithmId, Buffer.create(0));  // same as Arduino lib v1.4.2 (no Data)
     }
 
     /**
@@ -1319,7 +1312,7 @@ namespace huskylens2 {
     //% subcategory="learning /forgetting"
     //% algorithmId.defl=128
     export function learnObjectAtCenterNUM(algorithmId: number): void {
-        learn_id = sendLearnCommand(Macro.CommandActionLearn, algorithmId, createInitializedBuffer(0));
+        learn_id = sendLearnCommand(Macro.CommandActionLearn, algorithmId, Buffer.create(0));  // same as Arduino lib v1.4.2 (no Data)
     }
 
     /**
@@ -1375,21 +1368,8 @@ namespace huskylens2 {
     //% Id.min=1 Id.max=100 Id.defl=1
     //% name.defl="object"
     export function setNameOfId(algorithmId: AlgorithmLearnSetNameOfId, Id: number, name: string): void {
-        // Create a Buffer containing Id and name
-        const nameBuf = Buffer.fromUTF8(name);
-        const dataBuf = Buffer.create(10 + 1 + nameBuf.length); // 10 bytes + 1-byte length + name
-
-        dataBuf[0] = Id; // Id
-        // Fill the remaining 9 bytes with 0
-        for (let i = 1; i < 10; i++) {
-            dataBuf[i] = 0;
-        }
-        // Name length
-        dataBuf[10] = nameBuf.length;
-        // Name content
-        for (let i = 0; i < nameBuf.length; i++) {
-            dataBuf[11 + i] = nameBuf[i];
-        }
+        // 14-byte Data header ([0] = Id, rest 0) + length-prefixed name
+        const dataBuf = appendString(createInitializedBuffer(Id), name);
 
         sendCommandAndWait(Macro.CommandSetNameById, algorithmId, dataBuf);
     }
@@ -1403,7 +1383,7 @@ namespace huskylens2 {
     //% subcategory="learning /forgetting"
     //% algorithmId.defl=huskylens2.Algorithm.AlgorithmFaceRecognition
     export function forgetAllIds(algorithmId: Algorithm): void {
-        sendCommandAndWait(Macro.CommandActionForget, algorithmId, createInitializedBuffer(algorithmId));
+        sendCommandAndWait(Macro.CommandActionForget, algorithmId, Buffer.create(0));  // same as Arduino lib v1.4.2 (no Data)
     }
 
     /**
@@ -1415,7 +1395,7 @@ namespace huskylens2 {
     //% subcategory="learning /forgetting"
     //% algorithmId.defl=128
     export function forgetAllIdsNUM(algorithmId: number): void {
-        sendCommandAndWait(Macro.CommandActionForget, algorithmId, createInitializedBuffer(algorithmId));
+        sendCommandAndWait(Macro.CommandActionForget, algorithmId, Buffer.create(0));  // same as Arduino lib v1.4.2 (no Data)
     }
 
 }

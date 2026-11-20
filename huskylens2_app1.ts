@@ -162,13 +162,13 @@ namespace huskylens2 {
         AlgorithmFallDownRecognition = 19,        // 19
 
         //% blockHidden=true
-        AlgorithmCustom0 = 20,                 // 20
+        AlgorithmCustom0 = 25,                 // 25 (protocol V0.4: 20 = depth camera, 21/22 = auto drive)
         //% blockHidden=true
-        AlgorithmCustom1 = 21,                 // 21
+        AlgorithmCustom1 = 26,                 // 26
         //% blockHidden=true
-        AlgorithmCustom2 = 22,                 // 22
+        AlgorithmCustom2 = 27,                 // 27
         //% blockHidden=true
-        AlgorithmBuiltinCount = 23,           // 23
+        AlgorithmBuiltinCount = 28,           // 28
         //% blockHidden=true
         AlgorithmCustomBegin = 128,           // 128
     }
