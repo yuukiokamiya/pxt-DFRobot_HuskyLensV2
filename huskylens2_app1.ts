@@ -294,6 +294,79 @@ namespace huskylens2 {
         basic.pause(5000);// Wait 5 seconds for model loading
     }
 
+    /**
+     * Run two algorithms at the same time.
+     * After this, get each algorithm's results with its own "get ... result" block.
+     * @param algo0 First algorithm.
+     * @param algo1 Second algorithm.
+     */
+    //% block="run algorithms together %algo0 and %algo1"
+    //% weight=198
+    //% group="algorithm switch"
+    //% algo0.defl=huskylens2.Algorithm.AlgorithmObjectTracking
+    //% algo1.defl=huskylens2.Algorithm.AlgorithmHandRecognition
+    export function setMultiAlgorithm2(algo0: Algorithm, algo1: Algorithm): void {
+        runMultiAlgorithm(algo0, algo1, Algorithm.AlgorithmAny);
+    }
+
+    /**
+     * Run three algorithms at the same time.
+     * After this, get each algorithm's results with its own "get ... result" block.
+     * @param algo0 First algorithm.
+     * @param algo1 Second algorithm.
+     * @param algo2 Third algorithm.
+     */
+    //% block="run algorithms together %algo0 and %algo1 and %algo2"
+    //% weight=197
+    //% group="algorithm switch"
+    //% algo0.defl=huskylens2.Algorithm.AlgorithmFaceRecognition
+    //% algo1.defl=huskylens2.Algorithm.AlgorithmHandRecognition
+    //% algo2.defl=huskylens2.Algorithm.AlgorithmObjectRecognition
+    export function setMultiAlgorithm3(algo0: Algorithm, algo1: Algorithm, algo2: Algorithm): void {
+        runMultiAlgorithm(algo0, algo1, algo2);
+    }
+
+    function runMultiAlgorithm(algo0: number, algo1: number, algo2: number): void {
+        let s = setMultiAlgorithmInternal(algo0, algo1, algo2);
+        let tries = 1;
+        while (!s && tries < 5) {
+            basic.pause(1000);
+            s = setMultiAlgorithmInternal(algo0, algo1, algo2);
+            tries++;
+        }
+        basic.pause(5000);// Wait 5 seconds for model loading (same as the Arduino example)
+    }
+
+    /**
+     * Set how often each of two combined algorithms runs (0 = paused).
+     * @param r0 Ratio of the first algorithm.
+     * @param r1 Ratio of the second algorithm.
+     */
+    //% block="set run ratio of combined algorithms %r0 : %r1"
+    //% weight=196
+    //% group="algorithm switch"
+    //% r0.min=0 r0.max=10 r0.defl=1
+    //% r1.min=0 r1.max=10 r1.defl=1
+    export function setMultiAlgorithmRatio2(r0: number, r1: number): void {
+        setMultiAlgorithmRatioInternal(r0, r1, -1);
+    }
+
+    /**
+     * Set how often each of three combined algorithms runs (0 = paused).
+     * @param r0 Ratio of the first algorithm.
+     * @param r1 Ratio of the second algorithm.
+     * @param r2 Ratio of the third algorithm.
+     */
+    //% block="set run ratio of combined algorithms %r0 : %r1 : %r2"
+    //% weight=195
+    //% group="algorithm switch"
+    //% r0.min=0 r0.max=10 r0.defl=1
+    //% r1.min=0 r1.max=10 r1.defl=1
+    //% r2.min=0 r2.max=10 r2.defl=1
+    export function setMultiAlgorithmRatio3(r0: number, r1: number, r2: number): void {
+        setMultiAlgorithmRatioInternal(r0, r1, r2);
+    }
+
     // ========================================================== face recognition ==================================================
     /**
      * Request one-time face recognition result and store it

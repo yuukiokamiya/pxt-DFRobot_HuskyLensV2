@@ -59,11 +59,11 @@ namespace huskylens2 {
         // RFU 0x30 - 0x3F
 
         // ===================== Memory Layout ====================
-        FrameBufferSize = 128,
-        MaxResultNum = 6,
+        FrameBufferSize = 512,          // large frames (hand/pose keypoints) need more than 128 bytes
+        MaxResultNum = 10,
         CmdBufferSize = 32,
-        AlgorithmCount = 1,
-        CustomAlgorithmCount = 1,
+        AlgorithmCount = 28,            // one result cache per algorithm (multi-algorithm support)
+        CustomAlgorithmCount = 3,
         // ===================== LCD Screen ====================
         LcdWidth = 640,
         LcdHeight = 480,
@@ -414,6 +414,7 @@ namespace huskylens2 {
         used: number = 0;
         name: string = "";
         content: string = "";
+        keypoints: number[] = [];
 
         constructor(buffer: Buffer) {
             super(buffer);
@@ -424,31 +425,42 @@ namespace huskylens2 {
             if (buffer.length <= S) {
                 return;
             }
+            // Layout: [S] name length, name, content length, content, algorithm private data
             const name_length = buffer[S];
-
-            // Check if name_length is 0, if so, there is no name field
-            if (name_length === 0) {
-                this.name = "";
-                // For license plate and OCR recognition, content may still exist even when name_length is 0
-                if (buffer.length > S + 1) {
-                    const content_length = buffer[S + 1];
-                    if (content_length > 0 && buffer.length >= S + 2 + content_length) {
-                        this.content = bufferToStringAtOffset(buffer, S + 2, content_length);
-                    } else {
-                        this.content = "";
-                    }
-                } else {
-                    this.content = "";
-                }
+            if (name_length > 0) {
+                // Directly decode from buffer at specific offsets, avoiding slice() which may have issues in MakeCode
+                this.name = bufferToStringAtOffset(buffer, S + 1, name_length);
+            }
+            const contentLenPos = S + 1 + name_length;
+            if (buffer.length <= contentLenPos) {
                 return;
             }
-
-            // Directly decode from buffer at specific offsets, avoiding slice() which may have issues in MakeCode
-            this.name = bufferToStringAtOffset(buffer, S + 1, name_length);
-            if (buffer.length > S + 1 + name_length) {
-                const content_length = buffer[S + 1 + name_length];
-                this.content = bufferToStringAtOffset(buffer, S + 2 + name_length, content_length);
+            const content_length = buffer[contentLenPos];
+            if (content_length > 0) {
+                // For license plate and OCR recognition, content may exist even when name_length is 0
+                this.content = bufferToStringAtOffset(buffer, contentLenPos + 1, content_length);
             }
+
+            // Algorithm private data: keypoints as int16 (x, y) pairs
+            // face: 5 points, hand: 21 points, pose: 17 points (same order as the Arduino library v1.4.2)
+            let p = contentLenPos + 1 + content_length;
+            while (p + 1 < buffer.length) {
+                const v = buffer[p] + buffer[p + 1] * 256;
+                this.keypoints.push(v > 32767 ? v - 65536 : v);
+                p += 2;
+            }
+        }
+
+        /**
+         * Get a keypoint coordinate.
+         * @param index keypoint index
+         * @param axis 0 = x, 1 = y
+         * @returns the coordinate, or -1 if this result has no such keypoint
+         */
+        keypoint(index: number, axis: number): number {
+            const i = index * 2 + (axis ? 1 : 0);
+            if (i < 0 || i >= this.keypoints.length) return -1;
+            return this.keypoints[i];
         }
 
         printInfo() {
@@ -487,8 +499,12 @@ namespace huskylens2 {
 
     // Helper function: Create Buffer from receive_buffer (optimized)
     function createBufferFromReceive(): Buffer {
-        const buf = Buffer.create(receive_buffer.length);
-        for (let j = 0; j < receive_buffer.length; j++) {
+        // Copy only the current frame: header(5) + data + checksum(1),
+        // so parsers can use buffer.length as the real data length.
+        let len = Macro.ContentIndex + receive_buffer[Macro.ContentSizeIndex] + 1;
+        if (len > receive_buffer.length) len = receive_buffer.length;
+        const buf = Buffer.create(len);
+        for (let j = 0; j < len; j++) {
             buf[j] = receive_buffer[j];
         }
         return buf;
@@ -796,12 +812,67 @@ namespace huskylens2 {
         return algorithmId;
     }
 
+    // Result cache slot for an algorithm. Built-in algorithms use their own Id;
+    // self-trained models registered by setMultiAlgorithm use Custom0..2; anything else uses slot 0.
+    function cacheSlot(algorithmId: number): number {
+        const id = toRealId(algorithmId);
+        if (id > 0 && id < Macro.AlgorithmCount) return id;
+        return 0;
+    }
+
+    /**
+     * Internal function: run up to three algorithms at the same time (combination algorithm).
+     * Pass Algorithm.AlgorithmAny (0) for unused slots.
+     */
+    //% blockHidden=true
+    export function setMultiAlgorithmInternal(algo0: number, algo1: number, algo2: number): boolean {
+        const algos = [algo0, algo1, algo2].filter(a => a != Algorithm.AlgorithmAny);
+        // Remember self-trained models (Id >= 128) so their results get their own cache slot
+        let n = 0;
+        for (let i = 0; i < Macro.CustomAlgorithmCount; i++) customId[i] = Algorithm.AlgorithmAny;
+        for (let i = 0; i < algos.length; i++) {
+            if (algos[i] >= Algorithm.AlgorithmCustomBegin && n < Macro.CustomAlgorithmCount) customId[n++] = algos[i];
+        }
+        // 14-byte Data: [0] count, [1] reserved, [2..7] algo ids (int16), [8..13] reserved
+        const dataBuf = createInitializedBuffer(algos.length);
+        for (let i = 0; i < algos.length; i++) writeInt16LE(dataBuf, 2 + i * 2, algos[i]);
+        const pkt = PacketHead.fromFields({
+            cmd: Macro.CommandSetMultiAlgorithm,
+            algorithmId: Algorithm.AlgorithmAny,
+            data: dataBuf,
+        });
+        if (waitForResponse(Macro.CommandReturnArgs, 3, pkt, 1000)) {
+            return getPacketDataFromResponse().retValue === 0;
+        }
+        return false;
+    }
+
+    /**
+     * Internal function: set how often each algorithm of the combination runs.
+     * Pass -1 for unused slots. The number of ratios must match the number of algorithms.
+     */
+    //% blockHidden=true
+    export function setMultiAlgorithmRatioInternal(r0: number, r1: number, r2: number): boolean {
+        const ratios = [r0, r1, r2].filter(r => r >= 0);
+        const dataBuf = createInitializedBuffer(ratios.length);
+        for (let i = 0; i < ratios.length; i++) writeInt16LE(dataBuf, 2 + i * 2, ratios[i]);
+        const pkt = PacketHead.fromFields({
+            cmd: Macro.CommandSetMultiAlgorithmRatio,
+            algorithmId: Algorithm.AlgorithmAny,
+            data: dataBuf,
+        });
+        if (waitForResponse(Macro.CommandReturnArgs, 3, pkt, 300)) {
+            return getPacketDataFromResponse().retValue === 0;
+        }
+        return false;
+    }
+
     /**
      * Internal function: check whether there is at least one unused cached result.
      */
     //% blockHidden=true
     export function availableInternal(algorithmId: number): boolean {
-        const cacheAlgo = 0;
+        const cacheAlgo = cacheSlot(algorithmId);
         for (let i = 0; i < Macro.MaxResultNum; i++) {
             const r = result[cacheAlgo][i];
             if (r != null) {
@@ -820,7 +891,7 @@ namespace huskylens2 {
      */
     //% blockHidden=true
     export function cachedResultMaxIdInternal(algorithmId: number): number {
-        const cacheAlgo = 0;
+        const cacheAlgo = cacheSlot(algorithmId);
         return maxId[cacheAlgo] || 0;
     }
 
@@ -837,8 +908,8 @@ namespace huskylens2 {
             data: dataBuf,
         });
 
-        // Normalize algorithm Id to 0 for caching
-        const cacheAlgo = 0;
+        // Each algorithm has its own cache slot (needed when running multiple algorithms)
+        const cacheAlgo = cacheSlot(algorithmId);
 
         // Clear previous results
         for (let i = 0; i < Macro.MaxResultNum; i++) {
@@ -886,7 +957,7 @@ namespace huskylens2 {
      */
     //% blockHidden=true
     export function cachedCenterResultInternal(algorithmId: number): ResultVariant | null {
-        const cacheAlgo = 0;
+        const cacheAlgo = cacheSlot(algorithmId);
         let centerIndex = -1;
         let minLen = 0x7FFFFFFF;
         const centerX = Macro.LcdWidth / 2;
@@ -912,7 +983,7 @@ namespace huskylens2 {
      */
     //% blockHidden=true
     export function cachedResultByIndexInternal(algorithmId: number, index: number): ResultVariant | null {
-        const cacheAlgo = 0;
+        const cacheAlgo = cacheSlot(algorithmId);
         if (index < 0 || index >= Macro.MaxResultNum) {
             return null;
         }
@@ -924,7 +995,7 @@ namespace huskylens2 {
      */
     //% blockHidden=true
     export function cachedResultByIdInternal(algorithmId: number, Id: number): ResultVariant | null {
-        const cacheAlgo = 0;
+        const cacheAlgo = cacheSlot(algorithmId);
         for (let i = 0; i < Macro.MaxResultNum; i++) {
             const r = result[cacheAlgo][i];
             if (r != null) {
@@ -942,7 +1013,7 @@ namespace huskylens2 {
      */
     //% blockHidden=true
     export function cachedResultNumInternal(algorithmId: number): number {
-        const cacheAlgo = 0;
+        const cacheAlgo = cacheSlot(algorithmId);
         let count = 0;
         for (let i = 0; i < Macro.MaxResultNum; i++) {
             if (result[cacheAlgo][i] != null) {
@@ -965,7 +1036,7 @@ namespace huskylens2 {
      */
     //% blockHidden=true
     export function cachedResultNumByIdInternal(algorithmId: number, Id: number): number {
-        const cacheAlgo = 0;
+        const cacheAlgo = cacheSlot(algorithmId);
         let count = 0;
         for (let i = 0; i < Macro.MaxResultNum; i++) {
             const r = result[cacheAlgo][i];
@@ -984,7 +1055,7 @@ namespace huskylens2 {
      */
     //% blockHidden=true
     export function cachedIndexResultByIdInternal(algorithmId: number, Id: number, index: number): ResultVariant | null {
-        const cacheAlgo = 0;
+        const cacheAlgo = cacheSlot(algorithmId);
         let currentIndex = 0;
         for (let i = 0; i < Macro.MaxResultNum; i++) {
             const r = result[cacheAlgo][i];
@@ -1006,7 +1077,7 @@ namespace huskylens2 {
      */
     //% blockHidden=true
     export function getCurrentBranchInternal(algorithmId: number): ResultVariant | null {
-        const cacheAlgo = 0;
+        const cacheAlgo = cacheSlot(algorithmId);
         const item = result[cacheAlgo] && result[cacheAlgo][0];
         return (item && item.level === 1) ? item : null;
     }
@@ -1016,7 +1087,7 @@ namespace huskylens2 {
      */
     //% blockHidden=true
     export function getUpcomingBranchCountInternal(algorithmId: number): number {
-        const cacheAlgo = 0;
+        const cacheAlgo = cacheSlot(algorithmId);
         let count = 0;
         for (let i = 0; i < Macro.MaxResultNum; i++) {
             if (result[cacheAlgo][i] != null) {
@@ -1031,7 +1102,7 @@ namespace huskylens2 {
      */
     //% blockHidden=true
     export function getBranchInternal(algorithmId: number, index: number): ResultVariant | null {
-        const cacheAlgo = 0;
+        const cacheAlgo = cacheSlot(algorithmId);
         const targetIndex = index + 1;
         for (let i = 1; i < Macro.MaxResultNum; i++) {
             if (result[cacheAlgo][i] != null && i === targetIndex) {

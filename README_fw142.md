@@ -25,6 +25,34 @@ DFRobot が公式の拡張を更新したら、そちらに戻してください
 
 ブロックの名前・形は変えていないので、今までのプログラムはそのまま使えます。
 
+## v1.3.0 で追加した機能（Arduino ライブラリ v1.4.2 から移植）
+
+### 複数のアルゴリズムの同時実行
+「algorithm switch」の所に、次のブロックを追加した。
+
+| ブロック | 内容 |
+|---|---|
+| run algorithms together A and B | 2つのアルゴリズムを同時に動かす |
+| run algorithms together A and B and C | 3つのアルゴリズムを同時に動かす（最大3つ） |
+| set run ratio of combined algorithms a : b (: c) | それぞれを動かす割合（0 = 止める） |
+
+同時に動かしたあとは、それぞれのアルゴリズムの「get ... result」ブロックで結果を取り、いつもの値のブロックで読む。
+そのために、結果の保存場所をアルゴリズムごとに分けた（今までは全アルゴリズムで1か所だった）。
+
+### 関節などの座標（キーポイント）
+| カテゴリ | ブロック | 点 |
+|---|---|---|
+| hand recognition | hand nearest to center keypoint [点] [x/y] / hand No.n keypoint [点] [x/y] | 手首、親指〜小指の関節と指先（21点） |
+| pose recognition | pose nearest to center keypoint [点] [x/y] / pose No.n keypoint [点] [x/y] | 鼻、目、耳、肩、ひじ、手首、腰、ひざ、足首（17点） |
+| face recognition | face nearest to center keypoint [点] [x/y] / face No.n keypoint [点] [x/y] | 両目、鼻、口の両端（5点） |
+
+先にそのアルゴリズムの「get ... result」を呼ぶ。対象や点がないときは -1 を返す。
+
+### その他
+- 受け取り用の領域を 128 → 512 バイトにした（関節のデータは1回分が大きいため）。
+- 一度に保存する結果を 6 → 10 個にした（Arduino の大きいメモリ向けの設定と同じ）。
+- micro:bit **V2** 向け。
+
 ## 使い方
 1. この内容を GitHub のリポジトリ（DFRobot のリポジトリのフォーク）に置く。
 2. MakeCode のプロジェクトで、公式の huskylens2 拡張を入れている場合は削除する
