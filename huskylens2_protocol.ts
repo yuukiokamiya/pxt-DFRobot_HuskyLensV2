@@ -303,7 +303,7 @@ namespace huskylens2 {
         get total_blocks_learned() { const value = this.buffer[8] + this.buffer[9] * 256; return value > 32767 ? value - 65536 : value; }
         set total_blocks_learned(v: number) { v = Math.max(-32768, Math.min(32767, v)); if (v < 0) v += 65536; this.buffer[8] = v & 0xff; this.buffer[9] = (v >> 8) & 0xff; }
         // Seventh union - int32_t / float (buffer[10..13]), added in protocol V0.4
-        get confidence() {
+        get conf() {
             if (this.buffer.length < Macro.DataHeaderSize) return 0;
             return this.buffer.getNumber(NumberFormat.Float32LE, 10);
         }
